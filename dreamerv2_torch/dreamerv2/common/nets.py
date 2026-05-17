@@ -1,8 +1,11 @@
 ﻿import re
 
+import numpy as np
+
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.distributions import Bernoulli, Independent, Normal
 
 import common
 
@@ -71,11 +74,12 @@ class EnsembleRSSM(common.Module):
     def _suff_stats_layer(self, name, x):
         pass
 
-    def kl_loss(self, post, prior, foward, balance, free, free_avq):
+    def kl_loss(self, post, prior, forward, balance, free, free_avg):
         pass
 
 
 class Encoder(common.Module):
+
     def __init__(
             self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', act='elu', norm='none',
             cnn_depth=48, cnn_kernels=(4, 4, 4, 4), mlp_layers=[400, 400, 400, 400]):
@@ -83,56 +87,19 @@ class Encoder(common.Module):
         self.shapes = shapes
         self.cnn_keys = []
         self.mlp_keys = []
-
         for k, v in shapes.items():
             if re.match(cnn_keys, k) and len(v) == 3:
                 self.cnn_keys.append(k)
-
         for k, v in shapes.items():
             if re.match(mlp_keys, k) and len(v) == 1:
                 self.mlp_keys.append(k)
-
         print('Encoder CNN inputs:', list(self.cnn_keys))
         print('Encoder MLP inputs:', list(self.mlp_keys))
-
         self._act = get_act(act)
         self._norm = norm
         self._cnn_depth = cnn_depth
         self._cnn_kernels = cnn_kernels
         self._mlp_layers = mlp_layers
-
-        if self.cnn_keys:
-            in_channels = sum(shapes[k][-1] for k in self.cnn_keys)
-            self.conv1 = nn.Conv2d(in_channels, 48, kernel_size=4, stride=2)
-            self.conv2 = nn.Conv2d(48, 96, kernel_size=4, stride=2)
-            self.conv3 = nn.Conv2d(96, 192, kernel_size=4, stride=2)
-            self.conv4 = nn.Conv2d(192, 384, kernel_size=4, stride=2)
-
-        if self.mlp_keys:
-            in_features = sum(shapes[k][0] for k in self.mlp_keys)
-            self.fc1 = nn.Linear(in_features, 400)
-            self.fc2 = nn.Linear(400, 400)
-            self.fc3 = nn.Linear(400, 400)
-            self.fc4 = nn.Linear(400, 400)
-
-    def _cnn(self, data):
-        x = torch.cat(list(data.values()), -1)
-        x = x.to(dtype=torch.float32)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = self._act(self.conv1(x))
-        x = self._act(self.conv2(x))
-        x = self._act(self.conv3(x))
-        x = self._act(self.conv4(x))
-        return x.reshape(x.size(0), -1)
-
-    def _mlp(self, data):
-        x = torch.cat(list(data.values()), -1)
-        x = x.to(dtype=torch.float32)
-        x = self._act(self.fc1(x))
-        x = self._act(self.fc2(x))
-        x = self._act(self.fc3(x))
-        x = self._act(self.fc4(x))
-        return x
 
     def forward(self, data):
         key, shape = list(self.shapes.items())[0]
@@ -140,14 +107,33 @@ class Encoder(common.Module):
         data = {
             k: v.reshape((-1,) + tuple(v.shape)[len(batch_dims):])
             for k, v in data.items()}
-
         outputs = []
         if self.cnn_keys:
             outputs.append(self._cnn({k: data[k] for k in self.cnn_keys}))
         if self.mlp_keys:
             outputs.append(self._mlp({k: data[k] for k in self.mlp_keys}))
-        output = torch.cat(outputs, -1)
+        output = torch.concat(outputs, -1)
         return output.reshape(tuple(batch_dims) + tuple(output.shape[1:]))
+
+    def _cnn(self, data):
+        x = torch.concat(list(data.values()), -1)
+        x = x.to(dtype=torch.get_default_dtype())
+        x = x.permute(0, 3, 1, 2).contiguous()
+        for i, kernel in enumerate(self._cnn_kernels):
+            depth = 2 ** i * self._cnn_depth
+            x = self.get(f'conv{i}', nn.Conv2d, x.shape[1], depth, kernel, 2)(x)
+            x = self.get(f'convnorm{i}', NormLayer, self._norm)(x)
+            x = self._act(x)
+        return x.reshape(x.shape[0], -1)
+
+    def _mlp(self, data):
+        x = torch.concat(list(data.values()), -1)
+        x = x.to(dtype=torch.get_default_dtype())
+        for i, width in enumerate(self._mlp_layers):
+            x = self.get(f'dense{i}', nn.Linear, x.shape[-1], width)(x)
+            x = self.get(f'densenorm{i}', NormLayer, self._norm)(x)
+            x = self._act(x)
+        return x
 
 
 class Decoder(common.Module):
@@ -155,11 +141,16 @@ class Decoder(common.Module):
     def __init__(
             self, shapes, cnn_keys=r'.*', mlp_keys=r'.*', act='elu', norm='none',
             cnn_depth=48, cnn_kernels=(4, 4, 4, 4), mlp_layers=[400, 400, 400, 400]):
+        super().__init__()
         self._shapes = shapes
-        self.cnn_keys = [
-            k for k, v in shapes.items() if re.match(cnn_keys, k) and len(v) == 3]
-        self.mlp_keys = [
-            k for k, v in shapes.items() if re.match(mlp_keys, k) and len(v) == 1]
+        self.cnn_keys = []
+        self.mlp_keys = []
+        for k, v in shapes.items():
+            if re.match(cnn_keys, k) and len(v) == 3:
+                self.cnn_keys.append(k)
+        for k, v in shapes.items():
+            if re.match(mlp_keys, k) and len(v) == 1:
+                self.mlp_keys.append(k)
         print('Decoder CNN outputs:', list(self.cnn_keys))
         print('Decoder MLP outputs:', list(self.mlp_keys))
         self._act = get_act(act)
@@ -169,13 +160,44 @@ class Decoder(common.Module):
         self._mlp_layers = mlp_layers
 
     def forward(self, features):
-        pass
+        features = features.to(dtype=torch.get_default_dtype())
+        outputs = {}
+        if self.cnn_keys:
+            outputs.update(self._cnn(features))
+        if self.mlp_keys:
+            outputs.update(self._mlp(features))
+        return outputs
 
     def _cnn(self, features):
-        pass
+        channels = {k: self._shapes[k][-1] for k in self.cnn_keys}
+        x = self.get('convin', nn.Linear, features.shape[-1], 32 * self._cnn_depth)(features)
+        x = x.reshape(-1, 32 * self._cnn_depth, 1, 1)
+        for i, kernel in enumerate(self._cnn_kernels):
+            depth = 2 ** (len(self._cnn_kernels) - i - 2) * self._cnn_depth
+            act, norm = self._act, self._norm
+            if i == len(self._cnn_kernels) - 1:
+                depth, act, norm = sum(channels.values()), lambda x: x, 'none'
+            x = self.get(f'conv{i}', nn.ConvTranspose2d, x.shape[1], depth, kernel, 2)(x)
+            x = self.get(f'convnorm{i}', NormLayer, norm)(x)
+            x = act(x)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.reshape(tuple(features.shape[:-1]) + tuple(x.shape[1:]))
+        means = torch.split(x, list(channels.values()), dim=-1)
+        return {
+            key: Independent(Normal(mean, torch.ones_like(mean)), 3)
+            for (key, shape), mean in zip(channels.items(), means)}
 
     def _mlp(self, features):
-        pass
+        shapes = {k: self._shapes[k] for k in self.mlp_keys}
+        x = features
+        for i, width in enumerate(self._mlp_layers):
+            x = self.get(f'dense{i}', nn.Linear, x.shape[-1], width)(x)
+            x = self.get(f'densenorm{i}', NormLayer, self._norm)(x)
+            x = self._act(x)
+        dists = {}
+        for key, shape in shapes.items():
+            dists[key] = self.get(f'dense_{key}', DistLayer, shape)(x)
+        return dists
 
 
 class MSE(common.Module):
@@ -184,28 +206,57 @@ class MSE(common.Module):
         super().__init__()
 
 
-class _ChannelLastLayerNorm(common.Module):
+class DistLayer(common.Module):
 
-    def __init__(self, channels):
+    def __init__(self, shape, dist='mse', min_std=0.1, init_std=0.0):
         super().__init__()
-        self._layer = nn.LayerNorm(channels)
+        self._shape = tuple(shape)
+        self._dist = dist
+        self._min_std = min_std
+        self._init_std = init_std
+
+    def forward(self, inputs):
+        size = int(np.prod(self._shape))
+        out = self.get('out', nn.Linear, inputs.shape[-1], size)(inputs)
+        out = out.reshape(tuple(inputs.shape[:-1]) + self._shape)
+        out = out.to(dtype=torch.float32)
+        if self._dist in ('normal', 'tanh_normal', 'trunc_normal'):
+            std = self.get('std', nn.Linear, inputs.shape[-1], size)(inputs)
+            std = std.reshape(tuple(inputs.shape[:-1]) + self._shape)
+            std = std.to(dtype=torch.float32)
+        if self._dist == 'mse':
+            dist = Normal(out, torch.ones_like(out))
+            return Independent(dist, len(self._shape))
+        if self._dist == 'normal':
+            dist = Normal(out, std)
+            return Independent(dist, len(self._shape))
+        if self._dist == 'binary':
+            dist = Bernoulli(logits=out)
+            return Independent(dist, len(self._shape))
+        if self._dist in ('tanh_normal', 'trunc_normal', 'onehot'):
+            raise NotImplementedError(self._dist)
+        raise NotImplementedError(self._dist)
+
+
+class NormLayer(common.Module):
+
+    def __init__(self, name):
+        super().__init__()
+        if name == 'none':
+            self._layer = None
+        elif name == 'layer':
+            self._layer = 'layer'
+        else:
+            raise NotImplementedError(name)
 
     def forward(self, features):
-        if features.ndim != 4:
-            return self._layer(features)
-        features = features.permute(0, 2, 3, 1)
-        features = self._layer(features)
-        return features.permute(0, 3, 1, 2).contiguous()
-
-
-def _make_norm(name, size, dims):
-    if name == 'none':
-        return nn.Identity()
-    if name == 'layer':
-        if dims == 4:
-            return _ChannelLastLayerNorm(size)
-        return nn.LayerNorm(size)
-    raise NotImplementedError(name)
+        if not self._layer:
+            return features
+        if features.ndim == 4:
+            features = features.permute(0, 2, 3, 1)
+            features = self.get('layer', nn.LayerNorm, features.shape[-1])(features)
+            return features.permute(0, 3, 1, 2).contiguous()
+        return self.get('layer', nn.LayerNorm, features.shape[-1])(features)
 
 
 def get_act(name):
@@ -218,5 +269,3 @@ def get_act(name):
     if name == 'tanh':
         return torch.tanh
     raise NotImplementedError(name)
-
-
