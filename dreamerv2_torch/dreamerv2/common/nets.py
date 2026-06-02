@@ -200,6 +200,42 @@ class Decoder(common.Module):
         return dists
 
 
+class GRUCell(common.Module):
+    def __init__(self, size, norm=False, act='tanh', update_bias=-1, **kwargs):
+        super().__init__()
+        self._size = size
+        self._act = get_act(act)
+        self._norm = norm
+        self._update_bias = update_bias
+        self._layer = nn.LazyLinear(3 * size, bias=norm is not None, **kwargs)
+        if norm:
+            self._norm = nn.LayerNorm(3 * size)
+
+    @property
+    def state_size(self):
+        return self._size
+
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        if batch_size is None:
+            batch_size = inputs.shape[0]
+        return torch.zeros((batch_size, self._size), dtype=dtype)
+
+    def forward(self, inputs, state):
+        state = state[0]
+        parts = self._layer(torch.concat([inputs, state], -1))
+        if self._norm:
+            dtype = parts.dtype
+            parts = parts.to(dtype=torch.float32)
+            parts = self._norm(parts)
+            parts = parts.to(dtype=dtype)
+        reset, cand, update = torch.chunk(parts, 3, -1)
+        reset = torch.sigmoid(reset)
+        cand = self._act(reset * cand)
+        update = torch.sigmoid(update + self._update_bias)
+        output = update * cand + (1 - update) * state
+        return output, [output]
+
+
 class MLP(common.Module):
 
     def __init__(self, shape, layers, units, act='elu', norm='none', **out):
