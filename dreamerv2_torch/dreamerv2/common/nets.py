@@ -200,6 +200,28 @@ class Decoder(common.Module):
         return dists
 
 
+class MLP(common.Module):
+
+    def __init__(self, shape, layers, units, act='elu', norm='none', **out):
+        super().__init__()
+        self._shape = (shape, ) if isinstance(shape, int) else tuple(shape)
+        self._layers = layers
+        self._units = units
+        self._norm = norm
+        self._act = get_act(act)
+        self._out = out
+
+    def forward(self, features):
+        x = features.to(dtype=torch.get_default_dtype())
+        x = x.reshape([-1, x.shape[-1]])
+        for index in range(self._layers):
+            x = self.get(f'dense{index}', nn.Linear, x.shape[-1], self._units)(x)
+            x = self.get(f'norm{index}', NormLayer, self._norm)(x)
+            x = self._act(x)
+        x = x.reshape(tuple(features.shape[:-1]) + (x.shape[-1], ))
+        return self.get('out', DistLayer, self._shape, **self._out)(x)
+
+
 class GRUCell(common.Module):
     def __init__(self, size, norm=False, act='tanh', update_bias=-1, **kwargs):
         super().__init__()
@@ -234,28 +256,6 @@ class GRUCell(common.Module):
         update = torch.sigmoid(update + self._update_bias)
         output = update * cand + (1 - update) * state
         return output, [output]
-
-
-class MLP(common.Module):
-
-    def __init__(self, shape, layers, units, act='elu', norm='none', **out):
-        super().__init__()
-        self._shape = (shape, ) if isinstance(shape, int) else tuple(shape)
-        self._layers = layers
-        self._units = units
-        self._norm = norm
-        self._act = get_act(act)
-        self._out = out
-
-    def forward(self, features):
-        x = features.to(dtype=torch.get_default_dtype())
-        x = x.reshape([-1, x.shape[-1]])
-        for index in range(self._layers):
-            x = self.get(f'dense{index}', nn.Linear, x.shape[-1], self._units)(x)
-            x = self.get(f'norm{index}', NormLayer, self._norm)(x)
-            x = self._act(x)
-        x = x.reshape(tuple(features.shape[:-1]) + (x.shape[-1], ))
-        return self.get('out', DistLayer, self._shape, **self._out)(x)
 
 
 class DistLayer(common.Module):
