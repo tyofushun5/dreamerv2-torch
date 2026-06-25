@@ -1,6 +1,6 @@
 import torch
 
-import common
+from dreamerv2_torch import common
 import expl
 
 
